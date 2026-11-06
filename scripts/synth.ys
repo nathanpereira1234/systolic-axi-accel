@@ -1,0 +1,8 @@
+# Yosys generic synthesis of accel_top (N = 4)
+# Run from the repo root:  yosys -s scripts/synth.ys
+read_verilog -sv rtl/pe.sv rtl/systolic_array.sv rtl/accel_core.sv rtl/axil_slave.sv rtl/accel_top.sv
+chparam -set N 4 accel_top
+synth -top accel_top -flatten
+abc -g AND,NAND,OR,NOR,XOR,XNOR,MUX
+opt_clean
+tee -o synth_report.txt stat

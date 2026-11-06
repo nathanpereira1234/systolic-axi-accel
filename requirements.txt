@@ -1,0 +1,3 @@
+cocotb>=2.0
+cocotbext-axi>=0.1.24
+pytest

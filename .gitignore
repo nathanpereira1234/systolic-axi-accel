@@ -1,0 +1,12 @@
+sim_build/
+__pycache__/
+.pytest_cache/
+results.xml
+*.vcd
+*.fst
+synth_report.txt
+fpga/reports/
+.Xil/
+vivado*.log
+vivado*.jou
+obj_dir/
