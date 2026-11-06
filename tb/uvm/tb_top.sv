@@ -59,6 +59,6 @@ module tb_top;
 
   initial begin
     $dumpfile("dump.vcd");
-    $dumpvars(0, tb_top);
+    $dumpvars(1, tb_top.dut);   // only accel_top's ports: AXI bus + irq
   end
 endmodule
