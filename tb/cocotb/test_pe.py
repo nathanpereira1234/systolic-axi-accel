@@ -23,19 +23,24 @@ async def test_accumulate_random(dut):
     pairs = [(-128, -128), (127, 127), (-128, 127), (0, -128)]
     pairs += [(random.randint(-128, 127), random.randint(-128, 127)) for _ in range(500)]
 
+    # acc lags the operands by one cycle (product register), so after accepting
+    # pair i we check that acc holds the sum of pairs 0..i-1.
     expected = 0
-    for a, b in pairs:
+    prev = None
+    for a, b in pairs + [(0, 0)]:
         await FallingEdge(dut.clk)
         dut.en.value = 1
         dut.a_in.value = a
         dut.b_in.value = b
         await RisingEdge(dut.clk)
         await FallingEdge(dut.clk)
-        expected = wrap32(expected + a * b)
+        if prev is not None:
+            expected = wrap32(expected + prev[0] * prev[1])
         assert dut.acc.value.to_signed() == expected, f"acc {dut.acc.value.to_signed()} != {expected}"
         assert dut.a_out.value.to_signed() == a, "A not forwarded"
         assert dut.b_out.value.to_signed() == b, "B not forwarded"
-        dut.en.value = 0
+        prev = (a, b)
+        dut.en.value = 0                    # idle cycle between pairs, as before
 
 
 @cocotb.test()
@@ -48,7 +53,7 @@ async def test_clear_and_hold(dut):
     dut.b_in.value = 9
     await FallingEdge(dut.clk)
     dut.en.value = 0
-    for _ in range(3):
+    for _ in range(3):                      # one cycle to accumulate, then hold
         await FallingEdge(dut.clk)
     assert dut.acc.value.to_signed() == -63
     dut.clr.value = 1

@@ -950,10 +950,11 @@ module accel_core_sva (
 
   // Encodings must match accel_core's state_t
   localparam logic [2:0] S_IDLE = 3'd0, S_LOAD = 3'd1, S_COMPUTE = 3'd2,
-                         S_DRAIN = 3'd3, S_DONE = 3'd4;
+                         S_FLUSH = 3'd3, S_FLUSH2 = 3'd4,
+                         S_DRAIN = 3'd5, S_DONE = 3'd6;
 
   a_state_legal: assert property (@(posedge clk) disable iff (!rst_n)
-    state inside {S_IDLE, S_LOAD, S_COMPUTE, S_DRAIN, S_DONE})
+    state inside {S_IDLE, S_LOAD, S_COMPUTE, S_FLUSH, S_FLUSH2, S_DRAIN, S_DONE})
     else `uvm_error("SVA", $sformatf("Illegal FSM state %0d", state))
 
   a_no_start_when_busy: assert property (@(posedge clk) disable iff (!rst_n)
@@ -973,11 +974,11 @@ module accel_core_sva (
     option.per_instance = 1;
     cp_state: coverpoint state {
       bins idle = {S_IDLE}; bins load = {S_LOAD}; bins compute = {S_COMPUTE};
-      bins drain = {S_DRAIN}; bins done = {S_DONE};
+      bins flush = {S_FLUSH}; bins flush2 = {S_FLUSH2}; bins drain = {S_DRAIN}; bins done = {S_DONE};
       bins run_start = (S_IDLE => S_LOAD => S_COMPUTE);
-      bins run_end   = (S_COMPUTE => S_DRAIN => S_DONE => S_IDLE);
+      bins run_end   = (S_COMPUTE => S_FLUSH => S_FLUSH2 => S_DRAIN => S_DONE => S_IDLE);
       bins b2b       = (S_DONE => S_IDLE [* 1:30] => S_LOAD);   // quick restart
-      illegal_bins bad = {[5:7]};
+      illegal_bins bad = {7};
     }
   endgroup
   cg_fsm fsm_cov = new();
@@ -1045,6 +1046,6 @@ module tb_top;
 
   initial begin
     $dumpfile("dump.vcd");
-    $dumpvars(0, tb_top);
+    $dumpvars(1, tb_top.dut);   // only accel_top's ports: AXI bus + irq
   end
 endmodule

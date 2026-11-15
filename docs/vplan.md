@@ -17,7 +17,7 @@ Checks: **SB** = UVM scoreboard, **SVA** = assertion (`tb/uvm/accel_sva.sv`), **
 | 9 | Illegal addresses | Unmapped, past-the-end, RO writes | SB expects SLVERR | `x_region_resp` unmapped/SLVERR |
 | 10 | AXI handshake rules | Random AW/W order and delays, random B/R ready delays | SVA `a_*_stable`, `a_b_after_aw_w`, `a_r_after_ar` | `c_aw_before_w`, `c_w_before_aw`, `c_aw_w_together`, `c_b_backpressure` |
 | 11 | FSM legality | All tests | SVA `a_state_legal`, `a_done_after_drain`, `a_start_leads_to_done` | `cg_fsm` states and transitions |
-| 12 | Latency | Single run | CT `test_core_latency` (3N cycles to done_pulse) | — |
+| 12 | Latency | Single run | CT `test_core_latency` (3N+2 cycles to done_pulse) | — |
 | 13 | Parameterization | N = 1, 2, 3, 4 | CT `make test-all-n` | all four sizes pass |
 
 Sign-off criteria: all tests pass on 5+ seeds, zero SVA failures, functional coverage at 100%

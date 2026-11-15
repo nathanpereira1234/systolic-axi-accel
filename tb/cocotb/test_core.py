@@ -64,9 +64,42 @@ async def test_core_corners(dut):
 
 @cocotb.test()
 async def test_core_latency(dut):
-    """Start-to-done_pulse latency must be 3N cycles (LOAD + 3N-2 COMPUTE + DRAIN)."""
+    """Start-to-done_pulse latency must be 3N+2 cycles (LOAD + 3N-2 COMPUTE + 2 FLUSH + DRAIN)."""
     n = array_size()
     await init(dut)
     cycles = await run(dut, random_matrix(n), random_matrix(n), n)
     dut._log.info("N=%d start-to-done latency: %d cycles", n, cycles)
-    assert cycles == 3 * n, f"latency {cycles}, expected {3 * n}"
+    assert cycles == 3 * n + 2, f"latency {cycles}, expected {3 * n + 2}"
+
+
+@cocotb.test()
+async def test_core_clear_c(dut):
+    """clear_c zeroes the C buffer when idle and is ignored while busy."""
+    n = array_size()
+    await init(dut)
+    await run(dut, const_matrix(n, 3), const_matrix(n, 5), n)
+    assert int(dut.c_mat.value) != 0
+
+    # Ignored while busy: pulse clear_c in the middle of a run
+    a, b = random_matrix(n), random_matrix(n)
+    await FallingEdge(dut.clk)
+    dut.a_mat.value = pack_matrix(a)
+    dut.b_mat.value = pack_matrix(b)
+    dut.start.value = 1
+    await FallingEdge(dut.clk)
+    dut.start.value = 0
+    await FallingEdge(dut.clk)
+    dut.clear_c.value = 1
+    await FallingEdge(dut.clk)
+    dut.clear_c.value = 0
+    while not int(dut.done_pulse.value):
+        await FallingEdge(dut.clk)
+    assert unpack_matrix(int(dut.c_mat.value), n) == matmul(a, b), "clear_c acted while busy"
+
+    # Accepted when idle: C is zero within two cycles of the pulse
+    await FallingEdge(dut.clk)
+    dut.clear_c.value = 1
+    await FallingEdge(dut.clk)
+    dut.clear_c.value = 0
+    await FallingEdge(dut.clk)
+    assert int(dut.c_mat.value) == 0, "clear_c did not zero the C buffer"

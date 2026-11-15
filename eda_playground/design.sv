@@ -6,13 +6,24 @@
 // pe.sv - Processing element for an output-stationary systolic array.
 // Multiplies signed INT8 operands, accumulates into a signed 32-bit register,
 // and forwards A to the right and B downward one cycle later.
+//
+// The multiply-accumulate is written to map onto one Xilinx DSP48 slice:
+//   stage 1: prod_q <= a_in * b_in          (DSP M register)
+//   stage 2: acc    <= acc + prod_q         (DSP P register, accumulate)
+// All registers use a SYNCHRONOUS reset/clear, because the DSP48's internal
+// pipeline registers only support synchronous reset; an asynchronous reset
+// forces the multiplier out into LUTs.
+//
+// Timing: acc reflects a product one cycle after the operands were accepted
+// (en_d is en delayed by one cycle). A/B forwarding is unchanged, so every PE
+// lags by the same cycle and the systolic alignment is preserved.
 // ---------------------------------------------------------------------------
 module pe #(
   parameter int DW = 8,   // operand width
   parameter int AW = 32   // accumulator width
 ) (
   input  logic                 clk,
-  input  logic                 rst_n,
+  input  logic                 rst_n,   // active-low, sampled synchronously
   input  logic                 clr,     // synchronous clear of acc and pipeline regs
   input  logic                 en,      // compute enable
   input  logic signed [DW-1:0] a_in,
@@ -21,22 +32,30 @@ module pe #(
   output logic signed [DW-1:0] b_out,
   output logic signed [AW-1:0] acc
 );
-  logic signed [2*DW-1:0] prod;
-  assign prod = a_in * b_in;   // both operands signed -> signed product
+  (* use_dsp = "yes" *) logic signed [2*DW-1:0] prod_q;  // registered product
+  logic                    en_d;                         // en delayed to match prod_q
 
-  always_ff @(posedge clk or negedge rst_n) begin
-    if (!rst_n) begin
+  // Operand forwarding (fabric registers)
+  always_ff @(posedge clk) begin
+    if (!rst_n || clr) begin
       a_out <= '0;
       b_out <= '0;
-      acc   <= '0;
-    end else if (clr) begin
-      a_out <= '0;
-      b_out <= '0;
-      acc   <= '0;
     end else if (en) begin
       a_out <= a_in;
       b_out <= b_in;
-      acc   <= acc + {{(AW-2*DW){prod[2*DW-1]}}, prod};  // sign-extend to AW bits
+    end
+  end
+
+  // Multiply-accumulate pipeline (maps to DSP48: M register + P accumulator)
+  always_ff @(posedge clk) begin
+    if (!rst_n || clr) begin
+      prod_q <= '0;
+      en_d   <= 1'b0;
+      acc    <= '0;
+    end else begin
+      en_d <= en;
+      if (en)   prod_q <= a_in * b_in;   // both operands signed -> signed product
+      if (en_d) acc    <= acc + {{(AW-2*DW){prod_q[2*DW-1]}}, prod_q};  // sign-extend to AW
     end
   end
 endmodule
@@ -109,7 +128,14 @@ endmodule
 // the same k = t-i-j. The last product reaches PE(N-1,N-1) at t = 3N-3, so
 // COMPUTE lasts 3N-2 cycles.
 //
-// FSM: IDLE -> LOAD (clear array) -> COMPUTE -> DRAIN (copy to C buffer) -> DONE
+// Timing: the skew mux output is registered (a_left_q/b_top_q) so the mux is
+// not in the same cycle as the PE multiply-accumulate. The array enable and
+// clear are registered too (en_q/clr_q), which takes the FSM state bits off
+// the high-fanout nets into every PE. Each PE adds one more pipeline stage
+// (product register, for DSP48 mapping), so two FLUSH cycles wait for the
+// last delayed accumulate before DRAIN copies the results.
+//
+// FSM: IDLE -> LOAD -> COMPUTE -> FLUSH -> FLUSH2 -> DRAIN (copy to C) -> DONE
 // ---------------------------------------------------------------------------
 module accel_core #(
   parameter int N  = 4,
@@ -126,20 +152,24 @@ module accel_core #(
   output logic              busy,
   output logic              done_pulse   // 1-cycle pulse when C is valid
 );
-  typedef enum logic [2:0] {S_IDLE, S_LOAD, S_COMPUTE, S_DRAIN, S_DONE} state_t;
+  typedef enum logic [2:0] {S_IDLE, S_LOAD, S_COMPUTE, S_FLUSH, S_FLUSH2, S_DRAIN, S_DONE} state_t;
   state_t state;
 
   localparam int LAST_T = 3*N - 3;
   localparam int TW     = $clog2(3*N);
 
   logic [TW-1:0]     t;
-  logic [N*DW-1:0]   a_left, b_top;
+  logic [N*DW-1:0]   a_left, b_top;      // combinational skew mux output
+  logic [N*DW-1:0]   a_left_q, b_top_q;  // registered array inputs
+  // High-fanout control: registered, and Vivado may replicate them to meet timing
+  (* max_fanout = 64 *) logic en_q;      // array enable, aligned with *_q
+  (* max_fanout = 64 *) logic clr_q;     // array clear, one cycle after LOAD
   logic [N*N*AW-1:0] acc_flat;
   logic              arr_clr, arr_en;
 
   assign busy       = (state != S_IDLE);
-  assign arr_clr    = (state == S_LOAD);
-  assign arr_en     = (state == S_COMPUTE);
+  assign arr_clr    = clr_q;
+  assign arr_en     = en_q;
   assign done_pulse = (state == S_DONE);
 
   // Zero-extended counter so comparisons with integer loop variables are 32-bit
@@ -162,37 +192,78 @@ module accel_core #(
     end
   end
 
+  // Reset synchronizer for the array: asserts asynchronously, releases
+  // synchronously. The PEs use it as a synchronous reset (needed for DSP48
+  // mapping) without sampling the raw asynchronous rst_n input.
+  logic [1:0] arr_rst_sync;
+  logic       arr_rst_n;
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) arr_rst_sync <= 2'b00;
+    else        arr_rst_sync <= {arr_rst_sync[0], 1'b1};
+  end
+  assign arr_rst_n = arr_rst_sync[1];
+
+  // Input pipeline register: cuts the skew mux off the PE MAC path.
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      a_left_q <= '0;
+      b_top_q  <= '0;
+      en_q     <= 1'b0;
+      clr_q    <= 1'b0;
+    end else begin
+      a_left_q <= a_left;
+      b_top_q  <= b_top;
+      en_q     <= (state == S_COMPUTE);
+      clr_q    <= (state == S_LOAD);   // lands in COMPUTE cycle 0, before en_q rises
+    end
+  end
+
   systolic_array #(.N(N), .DW(DW), .AW(AW)) u_array (
     .clk      (clk),
-    .rst_n    (rst_n),
+    .rst_n    (arr_rst_n),
     .clr      (arr_clr),
     .en       (arr_en),
-    .a_left   (a_left),
-    .b_top    (b_top),
+    .a_left   (a_left_q),
+    .b_top    (b_top_q),
     .acc_flat (acc_flat)
   );
+
+  // Result-buffer control, registered: the load/clear enables for the 512-bit
+  // C buffer are decoded one cycle early so the FSM state bits don't drive
+  // ~570 flip-flops directly (that net was the critical path).
+  (* max_fanout = 64 *) logic c_load_q;  // high during DRAIN
+  (* max_fanout = 64 *) logic c_clr_q;   // one cycle after an accepted clear_c
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      c_load_q <= 1'b0;
+      c_clr_q  <= 1'b0;
+      c_mat    <= '0;
+    end else begin
+      c_load_q <= (state == S_FLUSH2);
+      c_clr_q  <= (state == S_IDLE) && !start && clear_c;
+      if (c_load_q)     c_mat <= acc_flat;
+      else if (c_clr_q) c_mat <= '0;
+    end
+  end
 
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
       state <= S_IDLE;
       t     <= '0;
-      c_mat <= '0;
     end else begin
       case (state)
         S_IDLE: begin
           t <= '0;
-          if (start)        state <= S_LOAD;
-          else if (clear_c) c_mat <= '0;
+          if (start) state <= S_LOAD;   // clear_c is handled by c_clr_q above
         end
         S_LOAD:    state <= S_COMPUTE;
         S_COMPUTE: begin
-          if (t32 == LAST_T) state <= S_DRAIN;
+          if (t32 == LAST_T) state <= S_FLUSH;
           else                   t <= t + 1'b1;
         end
-        S_DRAIN: begin
-          c_mat <= acc_flat;
-          state <= S_DONE;
-        end
+        S_FLUSH:  state <= S_FLUSH2; // last product enters the PE pipeline
+        S_FLUSH2: state <= S_DRAIN;  // last accumulate lands this cycle
+        S_DRAIN:  state <= S_DONE;   // c_load_q copies acc_flat into c_mat this cycle
         S_DONE:  state <= S_IDLE;
         default: state <= S_IDLE;
       endcase
